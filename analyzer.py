@@ -44,7 +44,9 @@ def decrypt_pkt(pkt_path):
     return True
 
 def clean_line(text):
-
+    """
+    Cleans text and converts spaces to tabs for indentation.
+    """
     if not text: return ""
     try: text = urllib.parse.unquote(text)
     except: pass
@@ -53,8 +55,11 @@ def clean_line(text):
     text = text.replace('\r', '')
     text = text.rstrip() # Remove trailing whitespace
     
-
-    return '\t' + text.lstrip(' ')
+    # NEW: Replace leading space with a tab for JSON legibility
+    if text.startswith(" "):
+        return "    " + text.lstrip()
+        
+    return text
 
 def parse_cisco_config(config_node):
     if config_node is None: return []
