@@ -55,7 +55,7 @@ def clean_line(text):
     text = text.replace('\r', '')
     text = text.rstrip() # Remove trailing whitespace
     
-    # NEW: Replace leading space with a tab for JSON legibility
+    # Replace leading space with a tab for JSON legibility
     if text.startswith(" "):
         return "    " + text.lstrip()
         
@@ -71,7 +71,6 @@ def parse_cisco_config(config_node):
         for line in line_nodes:
             if line.text: 
                 val = clean_line(line.text)
-                # Filter out lines that are strictly "!" (comments/spacers)
                 if val.strip() != "!":
                     lines.append(val)
         return lines
@@ -85,7 +84,6 @@ def parse_cisco_config(config_node):
         else:
             temp_lines = [clean_line(l) for l in raw_text.splitlines()]
             
-        # Filter '!' lines here as well
         return [l for l in temp_lines if l.strip() != "!"]
             
     return []
@@ -117,7 +115,6 @@ def extract_config_lines(device_node):
                          if "\\n" in raw: temp_lines = [l.strip() for l in raw.split('\\n')]
                          else: temp_lines = [l.strip() for l in raw.splitlines()]
                          
-                         # Apply cleaning and filtering
                          config_lines = []
                          for l in temp_lines:
                              cleaned = clean_line(l)
@@ -152,7 +149,7 @@ def parse_topology(xml_file):
     if version is not None: network_data["meta"]["pt_version"] = version.text
 
     print(f"[*] Scanning XML for devices...")
-    for device in root.findall(".//DEVICE"):
+    for i, device in enumerate(root.findall(".//DEVICE")):
         engine = device.find("ENGINE")
         if engine is None: continue
 
@@ -160,11 +157,27 @@ def parse_topology(xml_file):
         model = engine.find("TYPE").attrib.get("model", "Unknown") if engine.find("TYPE") is not None else "Unknown"
         type_str = engine.find("TYPE").text if engine.find("TYPE") is not None else "Unknown"
 
+        # --- EXTRACT VLANS ---
+        device_vlans = []
+        vlans_node = engine.find("VLANS")
+        if vlans_node is not None:
+            for v_node in vlans_node.findall("VLAN"):
+                v_num = v_node.attrib.get("number")
+                v_name = v_node.attrib.get("name")
+                if v_num:
+                    device_vlans.append({
+                        "number": v_num,
+                        "name": v_name if v_name else f"VLAN{v_num}"
+                    })
+        # ---------------------
+
         dev_info = {
+            "id": i,  # Kept ID for safe mapping in builder
             "name": name,
             "type": type_str,
             "model": model,
             "ports": [],
+            "vlans": device_vlans, # Added VLANs array
             "config": None,
             "pc_settings": {}
         }
@@ -207,7 +220,6 @@ def start_web_server():
     print(f" STARTING LOCAL WEB SERVER")
     print(f"="*50)
     
-    # 1. Find an Open Port
     port = DEFAULT_PORT
     httpd = None
     retries = 20
@@ -217,7 +229,7 @@ def start_web_server():
             httpd = socketserver.TCPServer(("", port), QuietHandler)
             break
         except OSError as e:
-            if e.errno == 98 or e.errno == 10048: # Address in use (Linux/Win)
+            if e.errno == 98 or e.errno == 10048: 
                 port += 1
                 retries -= 1
             else:
@@ -232,7 +244,6 @@ def start_web_server():
     print(f"[+] Opening browser to: {url}")
     print(f"[*] Press CTRL+C to stop the server and exit.")
     
-    # 2. Open Browser (WSL Safe Mode)
     is_wsl = False
     if hasattr(os, 'uname'):
         if "microsoft" in os.uname().release.lower():
@@ -247,7 +258,6 @@ def start_web_server():
     else:
         webbrowser.open(url)
     
-    # 3. Start Server Loop
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -267,8 +277,9 @@ def main():
         data = parse_topology(TEMP_XML_FILE)
         if data:
             generate_report(data)
-            if os.path.exists(TEMP_XML_FILE):
-                os.remove(TEMP_XML_FILE)
+            # IMPORTANT: Commented out deletion to allow builder.py to work
+            # if os.path.exists(TEMP_XML_FILE):
+            #    os.remove(TEMP_XML_FILE)
             start_web_server()
 
 if __name__ == "__main__":
