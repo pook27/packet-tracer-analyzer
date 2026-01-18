@@ -98,11 +98,10 @@ def parse_topology(xml_file):
 
     print(f"[*] Scanning XML for devices...")
     
-    # Map SAVE_REF_ID to internal Index
     ref_to_id = {}
-    # Map internal Index to Device Name (for readable links)
     id_to_name = {}
     
+    # 1. Parse Devices
     for i, device in enumerate(root.findall(".//DEVICE")):
         engine = device.find("ENGINE")
         if engine is None: continue
@@ -116,7 +115,6 @@ def parse_topology(xml_file):
         
         id_to_name[i] = name
 
-        # Extract VLANs
         device_vlans = []
         vlans_node = engine.find("VLANS")
         if vlans_node is not None:
@@ -155,9 +153,15 @@ def parse_topology(xml_file):
             dev_info["config"] = extract_config_lines(device)
         network_data["devices"].append(dev_info)
 
-    # 2. Parse Links
+    # 2. Parse Links (FIXED LOGIC)
     print(f"[*] Scanning XML for connections...")
-    links_node = root.find("LINKS")
+    
+    # Try finding LINKS inside NETWORK first (Standard PT)
+    links_node = root.find("NETWORK/LINKS")
+    if links_node is None:
+        # Fallback for old versions
+        links_node = root.find("LINKS")
+
     if links_node is not None:
         for link in links_node.findall("LINK"):
             cable = link.find("CABLE")
@@ -175,15 +179,12 @@ def parse_topology(xml_file):
                     dst_id = ref_to_id[dst_ref]
                     
                     network_data["links"].append({
-                        "from_device": id_to_name.get(src_id, "Unknown"), # Readable Name
+                        "from_device": id_to_name.get(src_id, "Unknown"),
                         "from_port": src_port,
-                        "to_device": id_to_name.get(dst_id, "Unknown"),   # Readable Name
+                        "to_device": id_to_name.get(dst_id, "Unknown"),
                         "to_port": dst_port,
                         "link_type": l_type,
-                        "cable_type": c_type,
-                        # We keep IDs just in case, but user doesn't need to look at them
-                        "_debug_from_id": src_id,
-                        "_debug_to_id": dst_id
+                        "cable_type": c_type
                     })
 
     return network_data
@@ -192,43 +193,6 @@ def generate_report(data):
     with open(JSON_OUTPUT_FILE, "w") as f:
         json.dump(data, f, indent=2)
     print(f"[*] Analysis complete. Data saved to '{JSON_OUTPUT_FILE}'")
-
-def start_web_server():
-    class QuietHandler(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, format, *args): pass
-
-    port = DEFAULT_PORT
-    httpd = None
-    retries = 20
-    while retries > 0:
-        try:
-            httpd = socketserver.TCPServer(("", port), QuietHandler)
-            break
-        except OSError:
-            port += 1
-            retries -= 1
-    
-    if httpd is None: return
-
-    url = f"http://localhost:{port}/{JSON_OUTPUT_FILE}"
-    print(f"[+] Server running at: http://localhost:{port}")
-    print(f"[+] Opening browser to: {url}")
-    
-    is_wsl = False
-    if hasattr(os, 'uname') and "microsoft" in os.uname().release.lower():
-        is_wsl = True
-            
-    if is_wsl:
-        try:
-            subprocess.run(["powershell.exe", "-c", f"Start-Process '{url}'"], 
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (FileNotFoundError, OSError):
-            webbrowser.open(url)
-    else:
-        webbrowser.open(url)
-    
-    try: httpd.serve_forever()
-    except KeyboardInterrupt: httpd.server_close()
 
 def main():
     if len(sys.argv) < 2:
@@ -240,7 +204,6 @@ def main():
         data = parse_topology(TEMP_XML_FILE)
         if data:
             generate_report(data)
-            #start_web_server()
 
 if __name__ == "__main__":
     main()
