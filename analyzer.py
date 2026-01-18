@@ -10,7 +10,6 @@ import socketserver
 
 # --- CONFIGURATION ---
 def get_pka2xml_path():
-    """Finds pka2xml binary dynamically (Script vs Compiled Exe)."""
     if getattr(sys, 'frozen', False):
         application_path = os.path.dirname(sys.executable)
     else:
@@ -29,63 +28,39 @@ def decrypt_pkt(pkt_path):
     if not os.path.exists(PKA2XML_BIN):
         print(f"[!] Error: {PKA2XML_BIN} tool not found.")
         return False
-    
-    try:
-        os.chmod(PKA2XML_BIN, 0o755)
-    except:
-        pass 
-
+    try: os.chmod(PKA2XML_BIN, 0o755)
+    except: pass 
     print(f"[*] Decrypting {pkt_path}...")
     result = subprocess.run([PKA2XML_BIN, "-d", pkt_path, TEMP_XML_FILE], capture_output=True, text=True)
-    
     if result.returncode != 0:
         print(f"[!] pka2xml failed:\n{result.stderr}")
         return False
     return True
 
 def clean_line(text):
-    """
-    Cleans text and converts spaces to tabs for indentation.
-    """
     if not text: return ""
     try: text = urllib.parse.unquote(text)
     except: pass
-    
-    text = text.replace('\\n', '') 
-    text = text.replace('\r', '')
-    text = text.rstrip() # Remove trailing whitespace
-    
-    # Replace leading space with a tab for JSON legibility
-    if text.startswith(" "):
-        return "    " + text.lstrip()
-        
+    text = text.replace('\\n', '').replace('\r', '').rstrip()
+    if text.startswith(" "): return "    " + text.lstrip()
     return text
 
 def parse_cisco_config(config_node):
     if config_node is None: return []
     lines = []
-    
-    # Method A: Structured <LINE> tags
     line_nodes = config_node.findall("LINE")
     if line_nodes:
         for line in line_nodes:
             if line.text: 
                 val = clean_line(line.text)
-                if val.strip() != "!":
-                    lines.append(val)
+                if val.strip() != "!": lines.append(val)
         return lines
-    
-    # Method B: Flat Text
     if config_node.text:
         raw_text = config_node.text
         temp_lines = []
-        if "\\n" in raw_text:
-            temp_lines = [clean_line(l) for l in raw_text.split('\\n')]
-        else:
-            temp_lines = [clean_line(l) for l in raw_text.splitlines()]
-            
+        if "\\n" in raw_text: temp_lines = [clean_line(l) for l in raw_text.split('\\n')]
+        else: temp_lines = [clean_line(l) for l in raw_text.splitlines()]
         return [l for l in temp_lines if l.strip() != "!"]
-            
     return []
 
 def extract_config_lines(device_node):
@@ -97,31 +72,6 @@ def extract_config_lines(device_node):
         if not config_lines:
             start_conf = engine.find("STARTUPCONFIG")
             if start_conf is not None: config_lines = parse_cisco_config(start_conf)
-
-    if not config_lines:
-        for file_node in device_node.findall(".//FILE"):
-            name = file_node.attrib.get("name", "").lower()
-            if "startup-config" in name or "running-config" in name:
-                content = file_node.find("CONTENT") or file_node.find("FILE_CONTENT/CONFIG")
-                if content is not None:
-                    if content.find("LINE") is not None:
-                         config_lines = parse_cisco_config(content)
-                    elif content.text:
-                         raw = content.text
-                         try: raw = urllib.parse.unquote(raw)
-                         except: pass
-                         
-                         temp_lines = []
-                         if "\\n" in raw: temp_lines = [l.strip() for l in raw.split('\\n')]
-                         else: temp_lines = [l.strip() for l in raw.splitlines()]
-                         
-                         config_lines = []
-                         for l in temp_lines:
-                             cleaned = clean_line(l)
-                             if cleaned.strip() != "!":
-                                 config_lines.append(cleaned)
-                         
-                if config_lines: break
     return config_lines
 
 def extract_pc_settings(device_node):
@@ -132,8 +82,6 @@ def extract_pc_settings(device_node):
     if gw is not None and gw.text: settings["Gateway"] = gw.text
     dns = engine.find("DNS_CLIENT/SERVER_IP")
     if dns is not None and dns.text: settings["DNS Server"] = dns.text
-    ipv6_gw = engine.find("GATEWAYV6")
-    if ipv6_gw is not None and ipv6_gw.text: settings["IPv6 Gateway"] = ipv6_gw.text
     return settings
 
 def parse_topology(xml_file):
@@ -144,20 +92,31 @@ def parse_topology(xml_file):
         print(f"[!] XML Parsing Error: {e}")
         return None
 
-    network_data = {"meta": {}, "devices": []}
+    network_data = {"meta": {}, "devices": [], "links": []}
     version = root.find("VERSION")
     if version is not None: network_data["meta"]["pt_version"] = version.text
 
     print(f"[*] Scanning XML for devices...")
+    
+    # Map SAVE_REF_ID to internal Index
+    ref_to_id = {}
+    # Map internal Index to Device Name (for readable links)
+    id_to_name = {}
+    
     for i, device in enumerate(root.findall(".//DEVICE")):
         engine = device.find("ENGINE")
         if engine is None: continue
 
         name = engine.find("NAME").text if engine.find("NAME") is not None else "Unnamed"
-        model = engine.find("TYPE").attrib.get("model", "Unknown") if engine.find("TYPE") is not None else "Unknown"
         type_str = engine.find("TYPE").text if engine.find("TYPE") is not None else "Unknown"
+        
+        save_ref = engine.find("SAVE_REF_ID")
+        if save_ref is not None:
+            ref_to_id[save_ref.text] = i
+        
+        id_to_name[i] = name
 
-        # --- EXTRACT VLANS ---
+        # Extract VLANs
         device_vlans = []
         vlans_node = engine.find("VLANS")
         if vlans_node is not None:
@@ -165,37 +124,29 @@ def parse_topology(xml_file):
                 v_num = v_node.attrib.get("number")
                 v_name = v_node.attrib.get("name")
                 if v_num:
-                    device_vlans.append({
-                        "number": v_num,
-                        "name": v_name if v_name else f"VLAN{v_num}"
-                    })
-        # ---------------------
+                    device_vlans.append({"number": v_num, "name": v_name if v_name else f"VLAN{v_num}"})
 
         dev_info = {
-            "id": i,  # Kept ID for safe mapping in builder
+            "id": i,
             "name": name,
             "type": type_str,
-            "model": model,
             "ports": [],
-            "vlans": device_vlans, # Added VLANs array
+            "vlans": device_vlans,
             "config": None,
             "pc_settings": {}
         }
 
         for port in device.findall(".//PORT"):
             p_data = {}
-            mac = port.find("MACADDRESS")
             ip = port.find("IP")
             mask = port.find("SUBNET")
             name_node = port.find("NAME")
-            if mac is not None:
-                p_data["mac"] = mac.text
-                if ip is not None and ip.text:
-                    p_data["ip"] = ip.text
-                    p_data["mask"] = mask.text if mask is not None else "/24"
-                if name_node is not None:
-                    p_data["name"] = name_node.text
-                dev_info["ports"].append(p_data)
+            if ip is not None and ip.text:
+                p_data["ip"] = ip.text
+                p_data["mask"] = mask.text if mask is not None else "/24"
+            if name_node is not None:
+                p_data["name"] = name_node.text
+            dev_info["ports"].append(p_data)
 
         if any(x in type_str for x in ["Pc", "Server", "Printer", "Laptop"]):
             dev_info["pc_settings"] = extract_pc_settings(device)
@@ -203,6 +154,38 @@ def parse_topology(xml_file):
         else:
             dev_info["config"] = extract_config_lines(device)
         network_data["devices"].append(dev_info)
+
+    # 2. Parse Links
+    print(f"[*] Scanning XML for connections...")
+    links_node = root.find("LINKS")
+    if links_node is not None:
+        for link in links_node.findall("LINK"):
+            cable = link.find("CABLE")
+            if cable is not None:
+                l_type = link.find("TYPE").text if link.find("TYPE") is not None else "eCopper"
+                c_type = cable.find("TYPE").text if cable.find("TYPE") is not None else "eStraightThrough"
+                src_ref = cable.find("FROM").text
+                dst_ref = cable.find("TO").text
+                ports = cable.findall("PORT")
+                src_port = ports[0].text if len(ports) > 0 else "Unknown"
+                dst_port = ports[1].text if len(ports) > 1 else "Unknown"
+
+                if src_ref in ref_to_id and dst_ref in ref_to_id:
+                    src_id = ref_to_id[src_ref]
+                    dst_id = ref_to_id[dst_ref]
+                    
+                    network_data["links"].append({
+                        "from_device": id_to_name.get(src_id, "Unknown"), # Readable Name
+                        "from_port": src_port,
+                        "to_device": id_to_name.get(dst_id, "Unknown"),   # Readable Name
+                        "to_port": dst_port,
+                        "link_type": l_type,
+                        "cable_type": c_type,
+                        # We keep IDs just in case, but user doesn't need to look at them
+                        "_debug_from_id": src_id,
+                        "_debug_to_id": dst_id
+                    })
+
     return network_data
 
 def generate_report(data):
@@ -211,76 +194,53 @@ def generate_report(data):
     print(f"[*] Analysis complete. Data saved to '{JSON_OUTPUT_FILE}'")
 
 def start_web_server():
-    """Starts a simple HTTP server with Port Conflicts + WSL support."""
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass
+        def log_message(self, format, *args): pass
 
-    print(f"\n" + "="*50)
-    print(f" STARTING LOCAL WEB SERVER")
-    print(f"="*50)
-    
     port = DEFAULT_PORT
     httpd = None
     retries = 20
-    
     while retries > 0:
         try:
             httpd = socketserver.TCPServer(("", port), QuietHandler)
             break
-        except OSError as e:
-            if e.errno == 98 or e.errno == 10048: 
-                port += 1
-                retries -= 1
-            else:
-                raise e
+        except OSError:
+            port += 1
+            retries -= 1
     
-    if httpd is None:
-        print(f"[!] Could not find an open port after 20 tries.")
-        return
+    if httpd is None: return
 
     url = f"http://localhost:{port}/{JSON_OUTPUT_FILE}"
     print(f"[+] Server running at: http://localhost:{port}")
     print(f"[+] Opening browser to: {url}")
-    print(f"[*] Press CTRL+C to stop the server and exit.")
     
     is_wsl = False
-    if hasattr(os, 'uname'):
-        if "microsoft" in os.uname().release.lower():
-            is_wsl = True
+    if hasattr(os, 'uname') and "microsoft" in os.uname().release.lower():
+        is_wsl = True
             
     if is_wsl:
         try:
             subprocess.run(["powershell.exe", "-c", f"Start-Process '{url}'"], 
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             webbrowser.open(url)
     else:
         webbrowser.open(url)
     
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[*] Stopping server. Goodbye!")
-        httpd.server_close()
+    try: httpd.serve_forever()
+    except KeyboardInterrupt: httpd.server_close()
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ./net-analyzer <input_file.pkt>")
-        if len(sys.argv) < 2:
-            input("\nPress Enter to exit...") 
-            return
+        print("Usage: python3 analyzer.py <input_file.pkt>")
+        return
 
     pkt_file = sys.argv[1]
-    
     if decrypt_pkt(pkt_file):
         data = parse_topology(TEMP_XML_FILE)
         if data:
             generate_report(data)
-            # IMPORTANT: Commented out deletion to allow builder.py to work
-            # if os.path.exists(TEMP_XML_FILE):
-            #    os.remove(TEMP_XML_FILE)
-            start_web_server()
+            #start_web_server()
 
 if __name__ == "__main__":
     main()
