@@ -16,6 +16,19 @@ PKA2XML_BIN = get_pka2xml_path()
 TEMP_XML_FILE = "temp_analysis.xml"
 INPUT_JSON = "analysis_output.json"
 
+def set_port_power(device_xml, port_name, state="true"):
+    """Forces the XML Physical Port state to match the Config"""
+    for port in device_xml.findall(".//PORT"):
+        ptype = port.find("TYPE")
+        if ptype is not None and "Copper" in ptype.text:
+            p_pow = port.find("POWER")
+            if p_pow is not None:
+                p_pow.text = state
+            
+            p_dup = port.find("FULLDUPLEX")
+            if p_dup is not None:
+                p_dup.text = "true"
+
 def update_vlan_database(engine, vlan_list):
     if not vlan_list: return
     vlans_node = engine.find("VLANS")

@@ -1,147 +1,169 @@
 import json
 import os
 import sys
-import subprocess
-import ipaddress
 
-# --- CONFIGURATION ---
-INPUT_INVENTORY = "analysis_output.json"
-OUTPUT_PKT = "OSPF_Ring.pkt"
-MISSION_FILE = "mission.json"
+INPUT_JSON = "analysis_output.json"
 
-class UniversalAgent:
+class NetworkAgent:
     def __init__(self):
-        self.data = self.load_json(INPUT_INVENTORY)
-        self.devices = self.data.get("devices", [])
-        self.links = [] 
-        self.data["links"] = self.links 
-        self.used_ports = {d["name"]: [] for d in self.devices}
-
-    def load_json(self, path):
-        if not os.path.exists(path):
-            print(f"[!] Error: {path} not found.")
+        if not os.path.exists(INPUT_JSON):
+            print(f"[!] Error: {INPUT_JSON} not found. Run analyzer.py first.")
             sys.exit(1)
-        with open(path, "r") as f: return json.load(f)
+            
+        with open(INPUT_JSON, "r") as f:
+            self.data = json.load(f)
+            
+        if "links" not in self.data: self.data["links"] = []
+        
+        # Map device names to data
+        self.devices = {d["name"]: d for d in self.data.get("devices", [])}
+        print(f"[*] Agent loaded {len(self.devices)} devices.")
 
-    def save_blueprint(self):
-        with open(INPUT_INVENTORY, "w") as f: json.dump(self.data, f, indent=2)
-        print(f"[*] Blueprint saved to {INPUT_INVENTORY}")
+    def save(self):
+        with open(INPUT_JSON, "w") as f:
+            json.dump(self.data, f, indent=2)
+        print(f"[*] Saved blueprint to {INPUT_JSON}")
 
-    def get_devices_by_type(self, type_filter):
-        matches = []
-        for d in self.devices:
-            t_str = d.get("type", "").upper()
-            n_str = d.get("name", "").upper()
-            filter_up = type_filter.upper()
-            if filter_up in t_str or filter_up in n_str:
-                matches.append(d)
-        return matches
+    def get_device(self, name):
+        return self.devices.get(name)
 
-    def wipe_config(self, target_type):
-        targets = self.get_devices_by_type(target_type)
-        print(f"[*] Wiping config for {len(targets)} {target_type}s...")
-        for dev in targets:
-            dev["config"] = [
-                "version 15.1",
-                "no service password-encryption",
-                f"hostname {dev['name']}"
-            ]
+    # --- PORT MANAGEMENT ---
 
-    def add_config_line(self, device, line):
-        if "config" not in device: device["config"] = []
-        device["config"].append(line)
+    def _get_used_ports(self, dev_name):
+        used = set()
+        for link in self.data["links"]:
+            if link["from_device"] == dev_name: used.add(link["from_port"])
+            if link["to_device"] == dev_name: used.add(link["to_port"])
+        return used
 
-    def get_next_port(self, device, port_prefix="GigabitEthernet0/"):
-        for i in range(0, 5): 
-            pname = f"{port_prefix}{i}"
-            if pname not in self.used_ports[device["name"]]:
-                self.used_ports[device["name"]].append(pname)
-                return pname
-        return f"{port_prefix}X"
+    def get_free_port(self, dev_name):
+        dev = self.get_device(dev_name)
+        if not dev: return None
+        
+        used = self._get_used_ports(dev_name)
+        
+        # Priority: Gig -> Fast -> Serial
+        candidates = []
+        for i in range(0, 4): candidates.append(f"GigabitEthernet0/{i}")
+        for i in range(1, 25): candidates.append(f"FastEthernet0/{i}")
+        for i in range(0, 2): candidates.append(f"Serial0/{i}/{i}")
+        
+        for p in candidates:
+            if p not in used: return p
+        return None
 
-    def build_ring(self, device_type, subnet_cidr):
-        targets = self.get_devices_by_type(device_type)
-        if len(targets) < 2:
-            print("[!] Need at least 2 devices for a ring.")
+    # --- CONFIGURATION HELPERS ---
+
+    def add_config(self, dev_name, lines):
+        dev = self.get_device(dev_name)
+        # Safety: Only add config to IOS devices (Routers/Switches)
+        # PCs typically have type "Pc" or "Server"
+        dtype = dev.get("type", "").upper()
+        if "PC" in dtype or "COMPUTER" in dtype or "SERVER" in dtype:
+            print(f"[!] Skipping IOS config for non-IOS device: {dev_name}")
             return
 
-        print(f"[*] Building Ring Topology for {len(targets)} devices...")
+        if "config" not in dev: dev["config"] = []
+        dev["config"].extend(lines)
+
+    # --- CORE ACTIONS ---
+
+    def connect(self, dev1, dev2):
+        p1 = self.get_free_port(dev1)
+        p2 = self.get_free_port(dev2)
         
-        # Subnet Calculator (Using /30s from the base CIDR)
-        base_net = ipaddress.IPv4Network(subnet_cidr)
-        subnets = list(base_net.subnets(new_prefix=30))
+        if not p1 or not p2:
+            print(f"[!] Error: No free ports on {dev1} or {dev2}")
+            return None, None
+
+        # Auto-Crossover Logic
+        d1 = self.get_device(dev1)
+        d2 = self.get_device(dev2)
+        t1 = d1.get("type", "").upper()
+        t2 = d2.get("type", "").upper()
         
-        count = len(targets)
-        for i in range(count):
-            dev_a = targets[i]
-            dev_b = targets[(i + 1) % count] # Wrap around
-            
-            if i >= len(subnets):
-                print("[!] Error: Not enough subnets!")
-                break
+        cable = "eStraightThrough"
+        # Router-Router or Switch-Switch needs CrossOver
+        if t1 == t2 or ("ROUTER" in t1 and "ROUTER" in t2): cable = "eCrossOver"
 
-            current_subnet = subnets[i]
-            ip_a = str(current_subnet.network_address + 1)
-            ip_b = str(current_subnet.network_address + 2)
-            mask = str(current_subnet.netmask)
-            
-            port_a = self.get_next_port(dev_a)
-            port_b = self.get_next_port(dev_b)
-            
-            print(f"    Link: {dev_a['name']}({port_a}) <--> {dev_b['name']}({port_b}) [{current_subnet}]")
-            
-            self.data["links"].append({
-                "from_device": dev_a["name"],
-                "from_port": port_a,
-                "to_device": dev_b["name"],
-                "to_port": port_b,
-                "link_type": "eCopper",
-                "cable_type": "eCrossOver"
-            })
-            
-            self.add_config_line(dev_a, f"interface {port_a}")
-            self.add_config_line(dev_a, f" ip address {ip_a} {mask}")
-            self.add_config_line(dev_a, " no shutdown")
-            self.add_config_line(dev_a, " exit")
+        self.data["links"].append({
+            "from_device": dev1, "from_port": p1,
+            "to_device": dev2, "to_port": p2,
+            "link_type": "eCopper", "cable_type": cable
+        })
+        print(f"[*] Wired {dev1}:{p1} <---> {dev2}:{p2} ({cable})")
 
-            self.add_config_line(dev_b, f"interface {port_b}")
-            self.add_config_line(dev_b, f" ip address {ip_b} {mask}")
-            self.add_config_line(dev_b, " no shutdown")
-            self.add_config_line(dev_b, " exit")
+        # Wake up ports
+        self.add_config(dev1, [f"interface {p1}", "no shutdown", "exit"])
+        self.add_config(dev2, [f"interface {p2}", "no shutdown", "exit"])
+        return p1, p2
 
-    def configure_ospf(self, device_type, area_id):
-        targets = self.get_devices_by_type(device_type)
-        print(f"[*] configuring OSPF Area {area_id} on {len(targets)} devices...")
-        for dev in targets:
-            try:
-                rid_num = int(''.join(filter(str.isdigit, dev['name'])))
-            except:
-                rid_num = self.devices.index(dev) + 1
-            
-            router_id = f"{rid_num}.{rid_num}.{rid_num}.{rid_num}"
-            self.add_config_line(dev, "router ospf 1")
-            self.add_config_line(dev, f" router-id {router_id}")
-            self.add_config_line(dev, f" network 0.0.0.0 255.255.255.255 area {area_id}")
-            self.add_config_line(dev, " exit")
+    def set_ip(self, dev_name, port, ip, mask):
+        print(f"[*] Setting IP on {dev_name} {port}: {ip}")
+        self.add_config(dev_name, [
+            f"interface {port}",
+            f" ip address {ip} {mask}",
+            " no shutdown",
+            " exit"
+        ])
 
-    def run_mission(self, mission_path):
-        mission = self.load_json(mission_path)
-        print(f"--- STARTING MISSION: {mission.get('comment', 'Unknown')} ---")
+    def enable_ospf(self, dev_name, process_id=1, area=0):
+        print(f"[*] Enabling OSPF on {dev_name}")
+        # Router ID generation logic
+        try: rid = int(''.join(filter(str.isdigit, dev_name)))
+        except: rid = 1
+        router_id = f"{rid}.{rid}.{rid}.{rid}"
         
-        for task in mission.get("tasks", []):
-            action = task.get("action")
-            if action == "clear_config":
-                self.wipe_config(task["target_type"])
-            elif action == "topology_ring":
-                self.build_ring(task["target_type"], task.get("subnet_base", "10.0.0.0/24"))
-            elif action == "enable_ospf":
-                self.configure_ospf(task["target_type"], task.get("area", 0))
-            
-        self.save_blueprint()
-        print("\n[Agent] Calling Builder...")
-        if os.path.exists("builder.py"):
-            subprocess.run(["python3", "builder.py", OUTPUT_PKT])
+        self.add_config(dev_name, [
+            f"router ospf {process_id}",
+            f" router-id {router_id}",
+            f" network 0.0.0.0 255.255.255.255 area {area}",
+            " exit"
+        ])
 
+    # --- NEW SWITCHING METHODS ---
+
+    def create_vlan(self, dev_name, vlan_id, name):
+        print(f"[*] Creating VLAN {vlan_id} on {dev_name}")
+        self.add_config(dev_name, [
+            f"vlan {vlan_id}",
+            f" name {name}",
+            " exit"
+        ])
+
+    def config_trunk(self, dev_name, port):
+        print(f"[*] Configuring Trunk on {dev_name}:{port}")
+        # Generic trunk config safe for most PT switches
+        self.add_config(dev_name, [
+            f"interface {port}",
+            " switchport mode trunk",
+            " no shutdown",
+            " exit"
+        ])
+
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    agent = UniversalAgent()
-    agent.run_mission(MISSION_FILE)
+    agent = NetworkAgent()
+    
+    # SETUP: R1 <-> R2 (OSPF Backbone)
+    #        R2 <-> S1 (Switched Network)
+    
+    # 1. Connect Devices
+    p_r1_r2, p_r2_r1 = agent.connect("R1", "R2")
+    p_r2_s1, p_s1_r2 = agent.connect("R2", "S1")
+
+    # 2. Configure OSPF between Routers
+    if p_r1_r2 and p_r2_r1:
+        agent.set_ip("R1", p_r1_r2, "10.0.0.1", "255.255.255.252")
+        agent.set_ip("R2", p_r2_r1, "10.0.0.2", "255.255.255.252")
+        agent.enable_ospf("R1")
+        agent.enable_ospf("R2")
+
+    # 3. Configure Switch (THE TEST)
+    # If this causes a crash, we know Switching logic is the culprit.
+    if p_s1_r2:
+        agent.create_vlan("S1", 10, "TEST_VLAN")
+        agent.create_vlan("S1", 20, "GUEST_VLAN")
+        agent.config_trunk("S1", p_s1_r2)
+
+    agent.save()
